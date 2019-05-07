@@ -134,6 +134,37 @@ local function request_access_token(code)
   return json.decode(res.body)
 end
 
+local function refresh_access_token(refresh_token)
+  local request = http.new()
+
+  request:set_timeout(7000)
+
+  local res, err = request:request_uri("https://accounts.google.com/o/oauth2/token", {
+    method = "POST",
+    body = ngx.encode_args({
+      refresh_token = refresh_token,
+      client_id     = client_id,
+      client_secret = client_secret,
+      redirect_uri  = cb_url,
+      grant_type    = "refresh_token",
+    }),
+    headers = {
+      ["Content-type"] = "application/x-www-form-urlencoded"
+    },
+    ssl_verify = true,
+  })
+  if not res then
+    return nil, (err or "auth token request failed: " .. (err or "unknown reason"))
+  end
+
+  if res.status ~= 200 then
+    return nil, "received " .. res.status .. " from https://accounts.google.com/o/oauth2/token: " .. res.body
+  end
+  ngx.log(ngx.WARN, "REFRESH_TOKEN:" .. res.body)
+
+  return json.decode(res.body)
+end
+
 local function request_profile(token)
   local request = http.new()
 
@@ -156,12 +187,54 @@ local function request_profile(token)
   return json.decode(res.body)
 end
 
+local function update_cookies(token)
+  local session_id = ngx.unescape_uri(ngx.var.cookie_OauthSessionId or "")
+  local profile, profile_err = request_profile(token["access_token"])
+
+  if session_id:len() == 0 then
+    -- TODO - check if token is not used
+    session_id = "_" .. math.random(1000000000) .. math.random(1000000000) .. math.random(1000000000)
+  end
+
+  if not profile then
+    ngx.log(ngx.ERR, "got error during profile request: " .. profile_err)
+    return ngx.exit(ngx.HTTP_FORBIDDEN)
+  end
+
+  if token.refresh_token then
+    ngx.shared['refresh_token_' .. session_id] = token.refresh_token
+  end
+
+  local expires      = ngx.time() + token["expires_in"]
+  local cookie_tail  = ";version=1;path=/;Max-Age=" .. extra_validity + token["expires_in"]
+  local ll_cookie_tail  = ";version=1;path=/;Max-Age=" .. (3600 * 24 * 365)
+  if secure_cookies then
+    cookie_tail = cookie_tail .. ";secure"
+  end
+  if http_only_cookies then
+    cookie_tail = cookie_tail .. ";httponly"
+  end
+
+  local email      = profile["email"]
+  local user_token = ngx.encode_base64(ngx.hmac_sha1(token_secret, cb_server_name .. email .. expires))
+
+  on_auth(email, user_token, expires)
+
+  ngx.header["Set-Cookie"] = {
+    "OauthEmail="       .. ngx.escape_uri(email) .. cookie_tail,
+    "OauthAccessToken=" .. ngx.escape_uri(user_token) .. cookie_tail,
+    "OauthExpires="     .. expires .. cookie_tail,
+    "OauthSessionId="     .. session_id .. ll_cookie_tail,
+  }
+end
+
 local function is_authorized()
   local headers = ngx.req.get_headers()
 
   local expires = tonumber(ngx.var.cookie_OauthExpires) or 0
   local email   = ngx.unescape_uri(ngx.var.cookie_OauthEmail or "")
   local token   = ngx.unescape_uri(ngx.var.cookie_OauthAccessToken or "")
+  local session_id = ngx.unescape_uri(ngx.var.cookie_OauthSessionId or "")
 
   if expires == 0 and headers["oauthexpires"] then
     expires = tonumber(headers["oauthexpires"])
@@ -181,6 +254,19 @@ local function is_authorized()
     on_auth(email, expected_token, expires)
     return true
   else
+    if session_id:len() > 0 then
+      local refresh_token = ngx.shared["refresh_token_" .. session_id]
+      ngx.log(ngx.WARN, "trying to refresh access token for "  .. session_id)
+      if refresh_token then
+        token, err = refresh_access_token(refresh_token)
+        if token then
+          update_cookies(token)
+          return true
+        else
+          ngx.log(ngx.ERR, err)
+        end
+      end
+    end
     return false
   end
 end
@@ -192,8 +278,10 @@ local function redirect_to_auth()
     scope         = "email",
     response_type = "code",
     redirect_uri  = cb_url,
+    access_type = "offline",
     state         = redirect_url,
     login_hint    = domain,
+    approval_prompt = "force",
   }))
 end
 
@@ -213,31 +301,7 @@ local function authorize()
     return ngx.exit(ngx.HTTP_FORBIDDEN)
   end
 
-  local profile, profile_err = request_profile(token["access_token"])
-  if not profile then
-    ngx.log(ngx.ERR, "got error during profile request: " .. profile_err)
-    return ngx.exit(ngx.HTTP_FORBIDDEN)
-  end
-
-  local expires      = ngx.time() + token["expires_in"]
-  local cookie_tail  = ";version=1;path=/;Max-Age=" .. extra_validity + token["expires_in"]
-  if secure_cookies then
-    cookie_tail = cookie_tail .. ";secure"
-  end
-  if http_only_cookies then
-    cookie_tail = cookie_tail .. ";httponly"
-  end
-
-  local email      = profile["email"]
-  local user_token = ngx.encode_base64(ngx.hmac_sha1(token_secret, cb_server_name .. email .. expires))
-
-  on_auth(email, user_token, expires)
-
-  ngx.header["Set-Cookie"] = {
-    "OauthEmail="       .. ngx.escape_uri(email) .. cookie_tail,
-    "OauthAccessToken=" .. ngx.escape_uri(user_token) .. cookie_tail,
-    "OauthExpires="     .. expires .. cookie_tail,
-  }
+  update_cookies(token)
 
   return ngx.redirect(uri_args["state"])
 end
@@ -245,6 +309,7 @@ end
 local function handle_signout()
   if uri == signout_uri then
     ngx.header["Set-Cookie"] = "OauthAccessToken==deleted; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT"
+    ngx.header["Set-Cookie"] = "OauthSessionId==deleted; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT"
     return ngx.redirect("/")
   end
 end
